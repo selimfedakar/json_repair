@@ -207,6 +207,7 @@ def repair_json(
                 stream_stable,
                 strict,
                 try_valid_json_suffix=try_valid_json_suffix,
+                recover_top_level_scalar=not skip_json_loads,
             )
             if logging:
                 parser.logger = repair_log

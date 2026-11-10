@@ -59,6 +59,7 @@ class JSONParser:
         stream_stable: bool = False,
         strict: bool = False,
         try_valid_json_suffix: bool = False,
+        recover_top_level_scalar: bool = False,
     ) -> None:
         # The string to parse
         self.json_str: str | StringFileWrapper = json_str
@@ -96,6 +97,10 @@ class JSONParser:
         # So strict mode was added to disable some of those heuristics.
         self.strict = strict
         self.try_valid_json_suffix = try_valid_json_suffix
+        # Only recover a bare top-level scalar payload when the whole-input
+        # json.loads validation was in effect (i.e. not skip_json_loads); in
+        # skip mode the caller is responsible for primitives (see issue #163).
+        self.recover_top_level_scalar = recover_top_level_scalar
         self.has_tried_valid_json_suffix = False
         self._last_parse_found_value = False
         self.schema_repairer: SchemaRepairer | None = None
@@ -151,6 +156,9 @@ class JSONParser:
     # Consolidate top-level parsing so we handle multiple sequential JSON values consistently
     # (including update semantics and strict-mode validation).
     def _parse_top_level(self, parse_element: Callable[[], JSONReturnType]) -> JSONReturnType:
+        recovered, scalar_value = self._try_recover_sole_top_level_scalar()
+        if recovered:
+            return scalar_value
         json = parse_element()
         if self.index < len(self.json_str):
             self.log(
@@ -244,6 +252,98 @@ class JSONParser:
 
         self.index += end_idx
         return True, value
+
+    def _try_recover_sole_top_level_scalar(self) -> tuple[bool, JSONReturnType]:
+        """Recover a scalar that is the only top-level payload.
+
+        The main dispatch only parses strings/numbers/booleans once it is
+        already inside an object or array, so a bare scalar that survives the
+        initial ``json.loads`` check (because it is wrapped in a markdown code
+        fence or comments) would otherwise be dropped and return "". Containers
+        already parse correctly and keep their richer repair heuristics, so this
+        only kicks in for scalars that raw-decode cleanly and are followed by
+        nothing but whitespace, comments, or a closing fence. Stray scalars that
+        trail other content (e.g. prose) are left to be dropped as before.
+        """
+        if (
+            not self.recover_top_level_scalar
+            or self.has_tried_valid_json_suffix
+            or self.index != 0
+            or not self.context.empty
+            or self.schema_repairer is not None
+            or not isinstance(self.json_str, str)
+        ):
+            return False, ""
+
+        start = self._scan_past_top_level_prelude()
+        if start is None:
+            return False, ""
+
+        try:
+            value, end_idx = json.JSONDecoder().raw_decode(self.json_str, start)
+        except (json.JSONDecodeError, ValueError):
+            return False, ""
+
+        if isinstance(value, (dict, list)):
+            return False, ""
+        if not self._only_trailing_noise(end_idx):
+            return False, ""
+
+        self.has_tried_valid_json_suffix = True
+        self.index = len(self.json_str)
+        return True, value
+
+    def _scan_past_top_level_prelude(self) -> int | None:
+        """Return the index of the payload after skipping leading whitespace,
+        comments, and a single opening markdown code fence. Return None when a
+        non-prelude character (such as prose) is reached first."""
+        s = self.json_str
+        assert isinstance(s, str)
+        n = len(s)
+        i = 0
+        fence_seen = False
+        while i < n:
+            c = s[i]
+            if c.isspace():
+                i += 1
+            elif s.startswith("//", i) or c == "#":
+                i += 1
+                while i < n and s[i] not in "\r\n":
+                    i += 1
+            elif s.startswith("/*", i):
+                end = s.find("*/", i + 2)
+                i = n if end == -1 else end + 2
+            elif not fence_seen and s.startswith("```", i):
+                fence_seen = True
+                i += 3
+                while i < n and s[i] not in "\r\n":  # drop an optional language tag
+                    i += 1
+            else:
+                return i
+        return None
+
+    def _only_trailing_noise(self, idx: int) -> bool:
+        """True when only whitespace, comments, and closing code fences follow idx."""
+        s = self.json_str
+        assert isinstance(s, str)
+        n = len(s)
+        i = idx
+        while i < n:
+            c = s[i]
+            if c.isspace():
+                i += 1
+            elif s.startswith("//", i) or c == "#":
+                i += 1
+                while i < n and s[i] not in "\r\n":
+                    i += 1
+            elif s.startswith("/*", i):
+                end = s.find("*/", i + 2)
+                i = n if end == -1 else end + 2
+            elif s.startswith("```", i):
+                i += 3
+            else:
+                return False
+        return True
 
     def _try_parse_missing_opening_object(self, delimiter: str) -> tuple[bool, JSONReturnType]:
         if self.scroll_whitespaces(-self.index) != 0:

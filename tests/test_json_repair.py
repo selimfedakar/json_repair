@@ -254,6 +254,36 @@ def test_multiple_jsons() -> None:
     assert repair_json('[{"key":"value"}][{"key":"value_after"}]') == '[{"key": "value_after"}]'
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("```json\n42\n```", 42),
+        ('```json\n"positive"\n```', "positive"),
+        ("```json\ntrue\n```", True),
+        ("```json\nnull\n```", None),
+        ("/* explanation */ 42", 42),
+        ("42 // trailing note", 42),
+        ("# leading note\n-5", -5),
+        # A quoted string that happens to contain structural characters must be
+        # returned verbatim, not mis-parsed into an array/object.
+        ('```json\n"has {brace} and [bracket]"\n```', "has {brace} and [bracket]"),
+    ],
+)
+def test_sole_top_level_scalar_in_fence_or_comment_is_recovered(raw: str, expected: object) -> None:
+    assert repair_json(raw, return_objects=True) == expected
+
+
+def test_sole_top_level_scalar_recovery_is_scoped() -> None:
+    # The same wrappers around a container keep working unchanged.
+    assert repair_json('```json\n{"a": 1}\n```', return_objects=True) == {"a": 1}
+    # A scalar that merely trails other content is still dropped as stray prose.
+    assert repair_json('lorem ```json {"key":"value"} ``` ipsum 42', return_objects=True) == {"key": "value"}
+    # With skip_json_loads the caller owns primitives (see issue #163), so the
+    # parser must not recover a bare scalar on its own.
+    assert repair_json("```json\n42\n```", skip_json_loads=True) == ""
+    assert repair_json("42 // note", skip_json_loads=True) == ""
+
+
 def test_top_level_separator_detects_pending_comma() -> None:
     parser = JSONParser(' , {"key": "value"}', None, False)
 
